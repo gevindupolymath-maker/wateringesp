@@ -15,6 +15,7 @@ const char* MQTT_HOST = "broker.emqx.io";
 const int   MQTT_PORT = 1883;
 
 const char* TOPIC_WATERING = "polywatering";
+const char* TOPIC_CMD      = "polywatering/cmd";   // phone -> ESP commands
 
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
@@ -27,6 +28,11 @@ static const uint8_t PIN_W3 = 2; // D4
 
 // If your relay is active-LOW, set this to true
 static const bool RELAY_ACTIVE_LOW = false;
+
+// ---------------- Manual override state ----------------
+volatile bool manualMode = false;          // false=AUTO, true=MANUAL
+volatile bool manualWaterOn = false;       // used when manualMode=true
+unsigned long manualUntilMs = 0;           // 0 = no timer (manual stays until OFF/AUTO)
 
 // ---------------- Timing ----------------
 unsigned long lastPublish = 0;
@@ -42,7 +48,6 @@ static const int   NTP_RESYNC_SEC = 6 * 3600;          // re-sync every 6h
 unsigned long lastNtpSync = 0;
 
 // ---------------- Open-Meteo API ----------------
-// User provided endpoint
 const char* RAIN_URL =
   "https://api.open-meteo.com/v1/forecast?latitude=6.9271&longitude=79.8612&current=rain,precipitation";
 
@@ -101,34 +106,19 @@ void connectWiFi() {
   }
 }
 
-void connectMQTT() {
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  while (!mqtt.connected()) {
-    String clientId = "watering-esp8266-" + String(ESP.getChipId(), HEX);
-    mqtt.connect(clientId.c_str());
-    if (!mqtt.connected()) delay(1000);
-  }
-}
-
 // Very small JSON extraction: finds `"key":<number>` and parses float.
-// Works for typical Open-Meteo JSON. If it fails, returns false.
 bool extractJsonNumber(const String& json, const char* key, float &outVal) {
   String pattern = String("\"") + key + "\":";
   int i = json.indexOf(pattern);
   if (i < 0) return false;
   i += pattern.length();
 
-  // Skip spaces
   while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t')) i++;
 
-  // Accept optional minus, digits, dot
   int start = i;
   while (i < (int)json.length()) {
     char c = json[i];
-    if ((c >= '0' && c <= '9') || c == '.' || c == '-' ) {
-      i++;
-      continue;
-    }
+    if ((c >= '0' && c <= '9') || c == '.' || c == '-') { i++; continue; }
     break;
   }
   if (i <= start) return false;
@@ -138,20 +128,14 @@ bool extractJsonNumber(const String& json, const char* key, float &outVal) {
 }
 
 bool updateRainFromApi() {
-  // HTTPS request (Open-Meteo is https)
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
   client->setInsecure(); // simplest: skip cert validation
 
   HTTPClient https;
-  if (!https.begin(*client, RAIN_URL)) {
-    return false;
-  }
+  if (!https.begin(*client, RAIN_URL)) return false;
 
   int code = https.GET();
-  if (code <= 0) {
-    https.end();
-    return false;
-  }
+  if (code <= 0) { https.end(); return false; }
 
   String body = https.getString();
   https.end();
@@ -160,10 +144,7 @@ bool updateRainFromApi() {
   bool okR = extractJsonNumber(body, "rain", r);
   bool okP = extractJsonNumber(body, "precipitation", p);
 
-  // If API responds but doesn't contain numbers, treat as "data not coming"
-  if (!okR && !okP) {
-    return false;
-  }
+  if (!okR && !okP) return false;
 
   if (okR) currentRainMM = r;
   if (okP) currentPrecMM = p;
@@ -172,15 +153,12 @@ bool updateRainFromApi() {
 }
 
 bool isRainingNow() {
-  // Consider raining if either current value is > 0
   return (currentRainMM > 0.0f) || (currentPrecMM > 0.0f);
 }
 
 bool getLocalHMS(int &hh, int &mm, int &ss) {
   time_t nowUtc = time(nullptr);
-  if (nowUtc < 1700000000) { // time not set (rough sanity)
-    return false;
-  }
+  if (nowUtc < 1700000000) return false; // time not set (rough sanity)
   time_t local = nowUtc + TZ_OFFSET_SEC;
   struct tm *t = gmtime(&local);
   if (!t) return false;
@@ -190,12 +168,77 @@ bool getLocalHMS(int &hh, int &mm, int &ss) {
   return true;
 }
 
-// True if time is inside [start, end) using minutes+seconds
 bool inWindow(int hh, int mm, int ss, int startH, int startM, int endH, int endM) {
   int cur = hh * 3600 + mm * 60 + ss;
   int a   = startH * 3600 + startM * 60;
   int b   = endH   * 3600 + endM   * 60;
   return (cur >= a && cur < b);
+}
+
+// ---------------- MQTT callback (mobile override commands) ----------------
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  msg.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+
+  msg.trim();
+  msg.toUpperCase();
+
+  Serial.print("MQTT cmd on ");
+  Serial.print(topic);
+  Serial.print(" => ");
+  Serial.println(msg);
+
+  // Commands:
+  // AUTO
+  // ON
+  // OFF
+  // ON:120  (seconds)
+  if (msg == "AUTO") {
+    manualMode = false;
+    manualWaterOn = false;
+    manualUntilMs = 0;
+    return;
+  }
+
+  if (msg == "ON") {
+    manualMode = true;
+    manualWaterOn = true;
+    manualUntilMs = 0;
+    return;
+  }
+
+  if (msg == "OFF") {
+    manualMode = true;
+    manualWaterOn = false;
+    manualUntilMs = 0;
+    return;
+  }
+
+  if (msg.startsWith("ON:")) {
+    int seconds = msg.substring(3).toInt();
+    if (seconds > 0) {
+      manualMode = true;
+      manualWaterOn = true;
+      manualUntilMs = millis() + (unsigned long)seconds * 1000UL;
+    }
+    return;
+  }
+}
+
+void connectMQTT() {
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(onMqttMessage);
+
+  while (!mqtt.connected()) {
+    String clientId = "watering-esp8266-" + String(ESP.getChipId(), HEX);
+    mqtt.connect(clientId.c_str());
+    if (!mqtt.connected()) delay(1000);
+  }
+
+  mqtt.subscribe(TOPIC_CMD); // <-- subscribe for phone commands
+  Serial.print("Subscribed to: ");
+  Serial.println(TOPIC_CMD);
 }
 
 void setup() {
@@ -221,7 +264,7 @@ void loop() {
 
   unsigned long nowMs = millis();
 
-  // Periodic NTP re-sync (helps long uptimes)
+  // Periodic NTP re-sync
   if (nowMs - lastNtpSync > (unsigned long)NTP_RESYNC_SEC * 1000UL) {
     configTime(0, 0, "pool.ntp.org", "time.google.com", "time.windows.com");
     lastNtpSync = nowMs;
@@ -246,7 +289,7 @@ void loop() {
     }
   }
 
-  // Publish every second, always
+  // Publish every second
   if (nowMs - lastPublish >= PUBLISH_MS) {
     lastPublish = nowMs;
 
@@ -254,35 +297,47 @@ void loop() {
     bool timeOk = getLocalHMS(hh, mm, ss);
 
     // Two watering windows:
-    // 07:58:00 - 08:00:00
-    // 16:00:00 - 16:02:00
     bool inMorning = timeOk && inWindow(hh, mm, ss, 7, 59, 8, 0);
     bool inEvening = timeOk && inWindow(hh, mm, ss, 16, 00, 16, 1);
     bool scheduleWantsWater = inMorning || inEvening;
 
-    // If rain data is valid, only water if NOT raining.
-    // If rain data is NOT valid, water anyway (as you requested).
     bool allowByRain = (!rainDataValid) ? true : (!isRainingNow());
 
-    bool wateringOn = scheduleWantsWater && allowByRain;
+    // Manual timer auto-off
+    if (manualMode && manualWaterOn && manualUntilMs > 0 && (long)(millis() - manualUntilMs) >= 0) {
+      manualWaterOn = false;
+      manualUntilMs = 0;
+    }
+
+    // FINAL decision
+    bool wateringOn;
+    const char* modeStr;
+
+    if (manualMode) {
+      wateringOn = manualWaterOn; // ignores schedule/rain
+      modeStr = "MANUAL";
+    } else {
+      wateringOn = scheduleWantsWater && allowByRain;
+      modeStr = "AUTO";
+    }
 
     setWateringOutputs(wateringOn);
 
-    // MQTT payload (topic polywatering)
-    // You said: body like { "watering": false }.
-    // We'll send true/false based on actual state.
-    char payload[64];
-    snprintf(payload, sizeof(payload), "{ \"watering\": %s }", wateringOn ? "true" : "false");
+    // Status publish
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{ \"watering\": %s, \"mode\": \"%s\" }",
+             wateringOn ? "true" : "false",
+             modeStr);
 
     mqtt.publish(TOPIC_WATERING, payload);
     Serial.println(payload);
 
-    // (Optional debug)
     if (timeOk) {
-      Serial.printf("Local time %02d:%02d:%02d | schedule=%d | rainValid=%d raining=%d | watering=%d\n",
-                    hh, mm, ss, (int)scheduleWantsWater, (int)rainDataValid, (int)isRainingNow(), (int)wateringOn);
+      Serial.printf("Local %02d:%02d:%02d | mode=%s | schedule=%d | rainValid=%d raining=%d | watering=%d\n",
+                    hh, mm, ss, modeStr, (int)scheduleWantsWater, (int)rainDataValid, (int)isRainingNow(), (int)wateringOn);
     } else {
-      Serial.printf("Time not set yet | schedule=%d | watering=%d\n", (int)scheduleWantsWater, (int)wateringOn);
+      Serial.printf("Time not set yet | mode=%s | watering=%d\n", modeStr, (int)wateringOn);
     }
   }
 }
